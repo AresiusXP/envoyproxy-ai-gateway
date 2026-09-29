@@ -141,6 +141,9 @@ type VersionedAPISchema struct {
 
 // OpenAIPrefix returns the OpenAI API prefix for the VersionedAPISchema.
 func (v VersionedAPISchema) OpenAIPrefix() string {
+	if v.Name == APISchemaAWSOpenAI && v.Prefix == "" {
+		return "openai/v1"
+	}
 	return v.Prefix
 }
 
@@ -178,6 +181,10 @@ const (
 	// Used for Claude models hosted on AWS Bedrock. Supports both OpenAI and Anthropic input formats
 	// depending on the endpoint path, similar to APISchemaGCPAnthropic.
 	APISchemaAWSAnthropic APISchemaName = "AWSAnthropic"
+	// APISchemaAWSOpenAI represents the AWS OpenAI-compatible API schema.
+	APISchemaAWSOpenAI APISchemaName = "AWSOpenAI"
+	// APISchemaTypeSafe represents the native TypeSafe AI System One API schema (Jev).
+	APISchemaTypeSafe APISchemaName = "TypeSafe"
 )
 
 // RouteRuleName is the name of the route rule.
@@ -197,6 +204,9 @@ type Backend struct {
 	HeaderMutation *HTTPHeaderMutation `json:"httpHeaderMutation,omitempty"`
 	// Body mutations to be applied to the request before sending to the backend. Optional.
 	BodyMutation *HTTPBodyMutation `json:"httpBodyMutation,omitempty"`
+	// HeaderValueFilters filter individual values out of multi-valued request headers before sending
+	// the request to the backend. Optional.
+	HeaderValueFilters []HTTPHeaderValueFilter `json:"headerValueFilters,omitempty"`
 }
 
 // BackendAuth corresponds partially to BackendSecurityPolicy in api/v1alpha1/api.go.
@@ -325,6 +335,16 @@ func (g GCPAuth) LogValue() slog.Value {
 		slog.String("region", g.Region),
 		slog.String("projectName", g.ProjectName),
 	)
+}
+
+// HTTPHeaderValueFilter filters individual values out of a multi-valued request header before
+// forwarding upstream. Mode is either "Denylist" (drop the listed Values) or "Allowlist" (keep only
+// the listed Values).
+type HTTPHeaderValueFilter struct {
+	// Name is the lower-cased name of the header whose values are filtered.
+	Name   string   `json:"name"`
+	Mode   string   `json:"mode"`
+	Values []string `json:"values,omitempty"`
 }
 
 // HTTPHeaderMutation defines the mutation of HTTP headers that will be applied to the request

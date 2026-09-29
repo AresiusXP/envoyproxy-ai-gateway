@@ -15,6 +15,7 @@ import (
 	cohereschema "github.com/envoyproxy/ai-gateway/internal/apischema/cohere"
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai/tokenize"
+	typesafeschema "github.com/envoyproxy/ai-gateway/internal/apischema/typesafe"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 	"github.com/envoyproxy/ai-gateway/internal/metrics"
 	"github.com/envoyproxy/ai-gateway/internal/tracing/tracingapi"
@@ -95,6 +96,16 @@ type RequestHeadersSetter interface {
 	SetRequestHeaders(headers map[string]string)
 }
 
+// HeaderValueFilterSetter is an optional interface for translators that can filter individual
+// values out of a multi-valued request header before forwarding upstream.
+//
+// It is called once per configured filter, so implementations must ignore headers they do not
+// handle. mode is either "Denylist" (drop the listed values) or "Allowlist" (keep only the listed
+// values); an unrecognized mode or an empty value list disables the filter.
+type HeaderValueFilterSetter interface {
+	SetHeaderValueFilter(name, mode string, values []string)
+}
+
 // ResponseRedactor is an optional interface that translators can implement
 // to support response body redaction for debug logging.
 type ResponseRedactor interface {
@@ -126,6 +137,8 @@ type (
 	OpenAICompletionTranslator = Translator[openai.CompletionRequest, tracingapi.CompletionSpan]
 	// CohereRerankTranslator translates the Cohere's /v2/rerank endpoint.
 	CohereRerankTranslator = Translator[cohereschema.RerankV2Request, tracingapi.RerankSpan]
+	// TypeSafeSystemOneTranslator translates the TypeSafe's /v1/systemone endpoint.
+	TypeSafeSystemOneTranslator = Translator[typesafeschema.SystemOneRequest, tracingapi.SystemOneSpan]
 	// AnthropicMessagesTranslator translates the Anthropic's /messages endpoint.
 	AnthropicMessagesTranslator = Translator[anthropicschema.MessagesRequest, tracingapi.MessageSpan]
 	// OpenAIImageGenerationTranslator translates the OpenAI's /images/generations endpoint.

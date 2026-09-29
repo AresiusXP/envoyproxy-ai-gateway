@@ -950,11 +950,11 @@ type ThinkingEnabled struct {
 }
 
 type ThinkingDisabled struct {
-	Type string `json:"type,"`
+	Type string `json:"type"`
 }
 
 type ThinkingAdaptive struct {
-	Type string `json:"type,"`
+	Type string `json:"type"`
 
 	// Optional. Controls how thinking content appears in the response ("summarized" or "omitted").
 	Display string `json:"display,omitempty"`
@@ -1208,8 +1208,33 @@ type ChatCompletionRequest struct {
 	// GuidedJSON: The output will follow the JSON schema.
 	GuidedJSON json.RawMessage `json:"guided_json,omitzero"`
 
+	// StructuredOutputs is the vLLM v0.12.0+ replacement for the deprecated top-level
+	// guided_json/guided_regex/guided_choice fields. It is passed through unchanged to
+	// vLLM backends and translated to the equivalent Gemini response schema on the GCP path.
+	StructuredOutputs *StructuredOutputs `json:"structured_outputs,omitzero"`
+
 	// Thinking: The thinking config for reasoning models
 	Thinking *ThinkingUnion `json:"thinking,omitzero"`
+}
+
+// StructuredOutputs mirrors vLLM's StructuredOutputsParams (v0.12.0+). Only JSON, Regex,
+// and Choice are translatable to GCP/Gemini; Grammar, StructuralTag, and WhitespacePattern
+// have no Gemini equivalent and are rejected on that path.
+//
+// Following vLLM convention: https://github.com/vllm-project/vllm/blob/v0.12.0/vllm/sampling_params.py#L33
+type StructuredOutputs struct {
+	// JSON: The output will follow the JSON schema.
+	JSON json.RawMessage `json:"json,omitzero"`
+	// Regex: The output will follow the regex pattern.
+	Regex string `json:"regex,omitzero"`
+	// Choice: The output will be exactly one of the choices.
+	Choice []string `json:"choice,omitzero"`
+	// Grammar: The output will follow the given grammar (vLLM/SGLang only).
+	Grammar string `json:"grammar,omitzero"`
+	// StructuralTag: Structural tag constraint (vLLM/SGLang only).
+	StructuralTag json.RawMessage `json:"structural_tag,omitzero"`
+	// WhitespacePattern: Whitespace pattern for JSON outputs (vLLM only).
+	WhitespacePattern string `json:"whitespace_pattern,omitzero"`
 }
 
 type StreamOptions struct {
@@ -1227,6 +1252,7 @@ const (
 	ToolTypeImageGeneration     ToolType = "image_generation"
 	ToolTypeEnterpriseWebSearch ToolType = "enterprise_search"
 	ToolTypeGoogleSearch        ToolType = "google_search"
+	ToolTypeAnthropicWebSearch  ToolType = "web_search_20260209"
 )
 
 // GCPGoogleSearchConfig contains GCP-specific configuration for Google Search grounding.
@@ -1245,6 +1271,7 @@ type GCPTimeRangeFilter struct {
 
 type Tool struct {
 	Type         ToolType               `json:"type"`
+	Name         string                 `json:"name,omitempty"`
 	Function     *FunctionDefinition    `json:"function,omitempty"`
 	GoogleSearch *GCPGoogleSearchConfig `json:"google_search,omitempty"` //nolint:tagliatelle
 }
@@ -1312,6 +1339,12 @@ type FunctionDefinition struct {
 	// Description is a description of what the function does, used by the model to choose when and how to call the function.
 	Description string `json:"description,omitempty"`
 	Strict      bool   `json:"strict,omitempty"`
+	// EagerInputStreaming streams this tool's input as the model generates it, instead of
+	// buffering and validating each parameter value before sending it. A pointer because
+	// Anthropic reads three states: true enables it, null defaults to buffering, and false
+	// keeps buffering even when the legacy fine-grained-tool-streaming beta is active, which
+	// otherwise turns unset tools on.
+	EagerInputStreaming *bool `json:"eager_input_streaming,omitempty"` //nolint:tagliatelle //follow anthropic api
 	// Parameters is an object describing the function.
 	// You can pass json.RawMessage to describe the schema,
 	// or you can pass in a struct which serializes to the proper JSON schema.
@@ -1571,7 +1604,25 @@ type PromptTokensDetails struct {
 	// Cached tokens present in the prompt.
 	CachedTokens int `json:"cached_tokens,omitzero"`
 	// Tokens written to the cache.
+	CacheWriteTokens int `json:"cache_write_tokens,omitzero"`
+	// Deprecated: use CacheWriteTokens. This field will be removed in v1.3.0.
 	CacheCreationTokens int `json:"cache_creation_input_tokens,omitzero"`
+}
+
+// CacheWriteTokensValue returns the greatest cache-write token value reported
+// under either the OpenAI or legacy AI Gateway field.
+func (p *PromptTokensDetails) CacheWriteTokensValue() int {
+	return max(p.CacheWriteTokens, p.CacheCreationTokens)
+}
+
+// MarshalJSON emits both cache-write field names with the same value for
+// backwards compatibility. Zero values retain the struct's omission behavior.
+func (p PromptTokensDetails) MarshalJSON() ([]byte, error) {
+	cacheWriteTokens := p.CacheWriteTokensValue()
+	p.CacheWriteTokens = cacheWriteTokens
+	p.CacheCreationTokens = cacheWriteTokens
+	type promptTokensDetails PromptTokensDetails
+	return json.Marshal(promptTokensDetails(p))
 }
 
 // ChatCompletionResponseChunk is described in the OpenAI API documentation:
@@ -3952,6 +4003,8 @@ type ResponseInputItemUnionParam struct {
 	OfWebSearchCall        *ResponseFunctionWebSearch
 	OfFunctionCall         *ResponseFunctionToolCall
 	OfFunctionCallOutput   *ResponseInputItemFunctionCallOutputParam
+	OfToolSearchCall       *ResponseToolSearchCall
+	OfToolSearchOutput     *ResponseToolSearchOutput
 	OfReasoning            *ResponseReasoningItem
 	OfCompaction           *ResponseCompactionItemParam
 	OfImageGenerationCall  *ResponseInputItemImageGenerationCallParam
@@ -3968,6 +4021,7 @@ type ResponseInputItemUnionParam struct {
 	OfMcpCall              *ResponseMcpCall
 	OfCustomToolCallOutput *ResponseCustomToolCallOutputParam
 	OfCustomToolCall       *ResponseCustomToolCall
+	OfCompactionTrigger    *ResponseInputItemCompactionTriggerParam
 	OfItemReference        *ResponseInputItemItemReferenceParam
 	// Codex-emitted item types whose schema is not yet part of the public Responses API.
 	// Preserve their raw JSON so OpenAI-compatible backends can handle them unchanged.
@@ -3996,6 +4050,10 @@ func (r ResponseInputItemUnionParam) MarshalJSON() ([]byte, error) { // nolint:g
 		return json.Marshal(r.OfFunctionCall)
 	case r.OfFunctionCallOutput != nil:
 		return json.Marshal(r.OfFunctionCallOutput)
+	case r.OfToolSearchCall != nil:
+		return json.Marshal(r.OfToolSearchCall)
+	case r.OfToolSearchOutput != nil:
+		return json.Marshal(r.OfToolSearchOutput)
 	case r.OfReasoning != nil:
 		return json.Marshal(r.OfReasoning)
 	case r.OfCompaction != nil:
@@ -4028,6 +4086,8 @@ func (r ResponseInputItemUnionParam) MarshalJSON() ([]byte, error) { // nolint:g
 		return json.Marshal(r.OfCustomToolCallOutput)
 	case r.OfCustomToolCall != nil:
 		return json.Marshal(r.OfCustomToolCall)
+	case r.OfCompactionTrigger != nil:
+		return json.Marshal(r.OfCompactionTrigger)
 	case r.OfItemReference != nil:
 		return json.Marshal(r.OfItemReference)
 	case r.OfAgentMessage != nil:
@@ -4134,6 +4194,18 @@ func (r *ResponseInputItemUnionParam) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		r.OfFunctionCallOutput = &fco
+	case "tool_search_call":
+		var tsc ResponseToolSearchCall
+		if err := json.Unmarshal(data, &tsc); err != nil {
+			return err
+		}
+		r.OfToolSearchCall = &tsc
+	case "tool_search_output":
+		var tso ResponseToolSearchOutput
+		if err := json.Unmarshal(data, &tso); err != nil {
+			return err
+		}
+		r.OfToolSearchOutput = &tso
 	case "reasoning":
 		var ri ResponseReasoningItem
 		if err := json.Unmarshal(data, &ri); err != nil {
@@ -4230,6 +4302,12 @@ func (r *ResponseInputItemUnionParam) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		r.OfCustomToolCall = &ctc
+	case "compaction_trigger":
+		var ct ResponseInputItemCompactionTriggerParam
+		if err := json.Unmarshal(data, &ct); err != nil {
+			return err
+		}
+		r.OfCompactionTrigger = &ct
 	case "item_reference":
 		var ir ResponseInputItemItemReferenceParam
 		if err := json.Unmarshal(data, &ir); err != nil {
@@ -5017,6 +5095,30 @@ type ResponseInputItemComputerCallOutputParam struct {
 	Type string `json:"type"`
 }
 
+// The output of a computer tool call returned as a Responses output item.
+//
+// The properties CallID, Output, Status, Type are required.
+type ResponseComputerToolCallOutputItem struct {
+	// The ID of the computer tool call that produced the output.
+	CallID string `json:"call_id"`
+	// A computer screenshot image used with the computer use tool.
+	Output ResponseComputerToolCallOutputScreenshotParam `json:"output,omitzero"`
+	// The unique ID of the computer call tool output.
+	ID string `json:"id,omitzero"`
+	// The safety checks reported by the API that have been acknowledged by the
+	// developer.
+	AcknowledgedSafetyChecks []ResponseInputItemComputerCallOutputAcknowledgedSafetyCheckParam `json:"acknowledged_safety_checks,omitzero"`
+	// The status of the item. One of `completed`, `incomplete`, `failed`, or
+	// `in_progress`.
+	//
+	// Any of "completed", "incomplete", "failed", "in_progress".
+	Status string `json:"status,omitzero"`
+	// The type of the computer tool call output. Always `computer_call_output`.
+	Type string `json:"type"`
+	// The identifier of the actor that created the item.
+	CreatedBy string `json:"created_by,omitzero"`
+}
+
 // A computer screenshot image used with the computer use tool.
 //
 // The property Type is required.
@@ -5165,6 +5267,8 @@ type ResponseFunctionToolCall struct {
 	CallID string `json:"call_id"`
 	// The name of the function to run.
 	Name string `json:"name"`
+	// The namespace containing the function, when the call targets a namespaced tool.
+	Namespace string `json:"namespace,omitzero"`
 	// The unique ID of the function tool call.
 	ID string `json:"id,omitzero"`
 	// The status of the item. One of `in_progress`, `completed`, or `incomplete`.
@@ -5173,6 +5277,70 @@ type ResponseFunctionToolCall struct {
 	// Any of "in_progress", "completed", "incomplete".
 	Status string `json:"status,omitzero"`
 	// The type of the function tool call. Always `function_call`.
+	Type string `json:"type"`
+}
+
+// A tool search call generated by the model.
+//
+// The properties Arguments, CallID, Execution, Status, Type are required.
+type ResponseToolSearchCall struct {
+	// The unique ID of the tool search call item.
+	ID string `json:"id,omitzero"`
+	// Arguments used for the tool search call.
+	Arguments any `json:"arguments,omitzero"`
+	// The unique ID of the tool search call generated by the model. Server-executed
+	// tool searches can return null for this field.
+	CallID *string `json:"call_id"`
+	// Whether tool search was executed by the server or by the client.
+	//
+	// Any of "server", "client".
+	Execution string `json:"execution,omitzero"`
+	// The status of the tool search call item that was recorded.
+	//
+	// Any of "in_progress", "completed", "incomplete".
+	Status string `json:"status,omitzero"`
+	// The type of the item. Always `tool_search_call`.
+	Type string `json:"type"`
+	// The identifier of the actor that created the item.
+	CreatedBy string `json:"created_by,omitzero"`
+}
+
+// The loaded tools returned by a tool search call.
+//
+// The properties Tools, Type are required.
+type ResponseToolSearchOutput struct {
+	// The unique ID of the tool search output item.
+	ID string `json:"id,omitzero"`
+	// The unique ID of the tool search call generated by the model. Server-executed
+	// tool searches can return null for this field.
+	CallID *string `json:"call_id"`
+	// Whether tool search was executed by the server or by the client.
+	//
+	// Any of "server", "client".
+	Execution string `json:"execution,omitzero"`
+	// The status of the tool search output.
+	//
+	// Any of "in_progress", "completed", "incomplete".
+	Status string `json:"status,omitzero"`
+	// The loaded tool definitions returned by tool search.
+	Tools []ResponseToolUnion `json:"tools,omitzero"`
+	// The type of the item. Always `tool_search_output`.
+	Type string `json:"type"`
+	// The identifier of the actor that created the item.
+	CreatedBy string `json:"created_by,omitzero"`
+}
+
+// Additional tool definitions made available as a Responses item.
+//
+// The properties Role, Tools, Type are required.
+type ResponseAdditionalTools struct {
+	// The unique ID of the additional tools item.
+	ID string `json:"id,omitzero"`
+	// The role that provided the additional tools.
+	Role string `json:"role,omitzero"`
+	// The additional tool definitions made available at this item.
+	Tools []ResponseToolUnion `json:"tools,omitzero"`
+	// The type of the item. Always `additional_tools`.
 	Type string `json:"type"`
 }
 
@@ -5905,6 +6073,27 @@ type ResponseCustomToolCallOutputParam struct {
 	Type string `json:"type"`
 }
 
+// The output of a custom tool call returned as a Responses output item.
+//
+// The properties CallID, Output, Type are required.
+type ResponseCustomToolCallOutputItem struct {
+	// The call ID, used to map this custom tool call output to a custom tool call.
+	CallID string `json:"call_id"`
+	// The output from the custom tool call generated by your code. Can be a string or
+	// a list of output content.
+	Output ResponseCustomToolCallOutputOutputUnionParam `json:"output,omitzero"`
+	// The unique ID of the custom tool call output item.
+	ID string `json:"id,omitzero"`
+	// The status of the item. One of `in_progress`, `completed`, or `incomplete`.
+	//
+	// Any of "in_progress", "completed", "incomplete".
+	Status string `json:"status,omitzero"`
+	// The identifier of the actor that created the item.
+	CreatedBy string `json:"created_by,omitzero"`
+	// The type of the custom tool call output. Always `custom_tool_call_output`.
+	Type string `json:"type"`
+}
+
 // ResponseCustomToolCallOutputOutputUnionParam is a union type for different custom tool call output parameters.
 // Only one field can be non-zero.
 type ResponseCustomToolCallOutputOutputUnionParam struct {
@@ -6031,6 +6220,12 @@ type ResponseInputItemItemReferenceParam struct {
 	ID string `json:"id"`
 	// The type of item to reference. Always `item_reference`.
 	Type string `json:"type,omitzero"`
+}
+
+// Compacts the current context. Must be the final input item.
+type ResponseInputItemCompactionTriggerParam struct {
+	// The type of the item. Always `compaction_trigger`.
+	Type string `json:"type"`
 }
 
 // ResponseToolChoiceUnion is a union type for tool choice configuration in Responses API.
@@ -6476,9 +6671,13 @@ type ResponseOutputItemUnion struct {
 	OfOutputMessage        *ResponseOutputMessage
 	OfFileSearchCall       *ResponseFileSearchToolCall
 	OfComputerCall         *ResponseComputerToolCall
+	OfComputerCallOutput   *ResponseComputerToolCallOutputItem
 	OfFunctionCall         *ResponseFunctionToolCall
 	OfFunctionCallOutput   *ResponseFunctionCallOutput
 	OfWebSearchCall        *ResponseFunctionWebSearch
+	OfToolSearchCall       *ResponseToolSearchCall
+	OfToolSearchOutput     *ResponseToolSearchOutput
+	OfAdditionalTools      *ResponseAdditionalTools
 	OfReasoning            *ResponseReasoningItem
 	OfCompaction           *ResponseCompactionItem
 	OfImageGenerationCall  *ResponseOutputItemImageGenerationCall
@@ -6491,7 +6690,9 @@ type ResponseOutputItemUnion struct {
 	OfMcpCall              *ResponseMcpCall
 	OfMcpListTools         *ResponseMcpListTools
 	OfMcpApprovalRequest   *ResponseMcpApprovalRequest
+	OfMcpApprovalResponse  *ResponseInputItemMcpApprovalResponseParam
 	OfCustomToolCall       *ResponseCustomToolCall
+	OfCustomToolCallOutput *ResponseCustomToolCallOutputItem
 }
 
 func (r ResponseOutputItemUnion) MarshalJSON() ([]byte, error) { // nolint:gocritic
@@ -6502,12 +6703,20 @@ func (r ResponseOutputItemUnion) MarshalJSON() ([]byte, error) { // nolint:gocri
 		return json.Marshal(r.OfFileSearchCall)
 	case r.OfComputerCall != nil:
 		return json.Marshal(r.OfComputerCall)
+	case r.OfComputerCallOutput != nil:
+		return json.Marshal(r.OfComputerCallOutput)
 	case r.OfFunctionCall != nil:
 		return json.Marshal(r.OfFunctionCall)
 	case r.OfFunctionCallOutput != nil:
 		return json.Marshal(r.OfFunctionCallOutput)
 	case r.OfWebSearchCall != nil:
 		return json.Marshal(r.OfWebSearchCall)
+	case r.OfToolSearchCall != nil:
+		return json.Marshal(r.OfToolSearchCall)
+	case r.OfToolSearchOutput != nil:
+		return json.Marshal(r.OfToolSearchOutput)
+	case r.OfAdditionalTools != nil:
+		return json.Marshal(r.OfAdditionalTools)
 	case r.OfReasoning != nil:
 		return json.Marshal(r.OfReasoning)
 	case r.OfCompaction != nil:
@@ -6532,8 +6741,12 @@ func (r ResponseOutputItemUnion) MarshalJSON() ([]byte, error) { // nolint:gocri
 		return json.Marshal(r.OfMcpListTools)
 	case r.OfMcpApprovalRequest != nil:
 		return json.Marshal(r.OfMcpApprovalRequest)
+	case r.OfMcpApprovalResponse != nil:
+		return json.Marshal(r.OfMcpApprovalResponse)
 	case r.OfCustomToolCall != nil:
 		return json.Marshal(r.OfCustomToolCall)
+	case r.OfCustomToolCallOutput != nil:
+		return json.Marshal(r.OfCustomToolCallOutput)
 	default:
 		return nil, errors.New("no output item to marshal")
 	}
@@ -6578,12 +6791,36 @@ func (r *ResponseOutputItemUnion) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		r.OfComputerCall = &c
+	case "computer_call_output":
+		var c ResponseComputerToolCallOutputItem
+		if err := json.Unmarshal(data, &c); err != nil {
+			return err
+		}
+		r.OfComputerCallOutput = &c
 	case "reasoning":
 		var rr ResponseReasoningItem
 		if err := json.Unmarshal(data, &rr); err != nil {
 			return err
 		}
 		r.OfReasoning = &rr
+	case "tool_search_call":
+		var t ResponseToolSearchCall
+		if err := json.Unmarshal(data, &t); err != nil {
+			return err
+		}
+		r.OfToolSearchCall = &t
+	case "tool_search_output":
+		var t ResponseToolSearchOutput
+		if err := json.Unmarshal(data, &t); err != nil {
+			return err
+		}
+		r.OfToolSearchOutput = &t
+	case "additional_tools":
+		var a ResponseAdditionalTools
+		if err := json.Unmarshal(data, &a); err != nil {
+			return err
+		}
+		r.OfAdditionalTools = &a
 	case "compaction":
 		var c ResponseCompactionItem
 		if err := json.Unmarshal(data, &c); err != nil {
@@ -6650,12 +6887,24 @@ func (r *ResponseOutputItemUnion) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		r.OfMcpApprovalRequest = &m
+	case "mcp_approval_response":
+		var m ResponseInputItemMcpApprovalResponseParam
+		if err := json.Unmarshal(data, &m); err != nil {
+			return err
+		}
+		r.OfMcpApprovalResponse = &m
 	case "custom_tool_call":
 		var c ResponseCustomToolCall
 		if err := json.Unmarshal(data, &c); err != nil {
 			return err
 		}
 		r.OfCustomToolCall = &c
+	case "custom_tool_call_output":
+		var c ResponseCustomToolCallOutputItem
+		if err := json.Unmarshal(data, &c); err != nil {
+			return err
+		}
+		r.OfCustomToolCallOutput = &c
 	default:
 		return fmt.Errorf("unknown type field value '%s' for response output item union", typ.String())
 	}
@@ -7079,7 +7328,25 @@ type ResponseUsageInputTokensDetails struct {
 	CachedTokens int64 `json:"cached_tokens"`
 
 	// The number of tokens that were written to the cache.
+	CacheWriteTokens int64 `json:"cache_write_tokens"`
+	// Deprecated: use CacheWriteTokens. This field will be removed in v1.3.0.
 	CacheCreationTokens int64 `json:"cache_creation_input_tokens"`
+}
+
+// CacheWriteTokensValue returns the greatest cache-write token value reported
+// under either the OpenAI or legacy AI Gateway field.
+func (r *ResponseUsageInputTokensDetails) CacheWriteTokensValue() int64 {
+	return max(r.CacheWriteTokens, r.CacheCreationTokens)
+}
+
+// MarshalJSON emits both cache-write field names with the same value for
+// backwards compatibility.
+func (r ResponseUsageInputTokensDetails) MarshalJSON() ([]byte, error) {
+	cacheWriteTokens := r.CacheWriteTokensValue()
+	r.CacheWriteTokens = cacheWriteTokens
+	r.CacheCreationTokens = cacheWriteTokens
+	type responseUsageInputTokensDetails ResponseUsageInputTokensDetails
+	return json.Marshal(responseUsageInputTokensDetails(r))
 }
 
 // A detailed breakdown of the output tokens.
@@ -7093,7 +7360,9 @@ type ResponseTokensDetails struct {
 	// CachedTokens: Number of cached tokens.
 	CachedTokens int `json:"cached_tokens,omitempty"` //nolint:tagliatelle //follow openai api
 
-	// CacheCreationTokens: number of tokens that were written to the cache.
+	// CacheWriteTokens: number of tokens that were written to the cache.
+	CacheWriteTokens int64 `json:"cache_write_tokens"` //nolint:tagliatelle
+	// Deprecated: use CacheWriteTokens. This field will be removed in v1.3.0.
 	CacheCreationTokens int64 `json:"cache_creation_input_tokens"` //nolint:tagliatelle
 
 	// ReasoningTokens: Number of reasoning tokens (for reasoning models).
@@ -7101,6 +7370,22 @@ type ResponseTokensDetails struct {
 
 	// AudioTokens: Number of audio tokens.
 	AudioTokens int `json:"audio_tokens,omitempty"` //nolint:tagliatelle //follow openai api
+}
+
+// CacheWriteTokensValue returns the greatest cache-write token value reported
+// under either the OpenAI or legacy AI Gateway field.
+func (r *ResponseTokensDetails) CacheWriteTokensValue() int64 {
+	return max(r.CacheWriteTokens, r.CacheCreationTokens)
+}
+
+// MarshalJSON emits both cache-write field names with the same value for
+// backwards compatibility.
+func (r ResponseTokensDetails) MarshalJSON() ([]byte, error) {
+	cacheWriteTokens := r.CacheWriteTokensValue()
+	r.CacheWriteTokens = cacheWriteTokens
+	r.CacheCreationTokens = cacheWriteTokens
+	type responseTokensDetails ResponseTokensDetails
+	return json.Marshal(responseTokensDetails(r))
 }
 
 // An error object returned when the model fails to generate a Response.
